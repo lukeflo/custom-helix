@@ -87,6 +87,11 @@ use grep_searcher::{sinks, BinaryDetection, SearcherBuilder};
 use ignore::{DirEntry, WalkBuilder, WalkState};
 
 pub type OnKeyCallback = Box<dyn FnOnce(&mut Context, KeyEvent)>;
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+pub enum OnKeyCallbackKind {
+    PseudoPending,
+    Fallback,
+}
 
 pub struct Context<'a> {
     pub register: Option<char>,
@@ -94,7 +99,7 @@ pub struct Context<'a> {
     pub editor: &'a mut Editor,
 
     pub callback: Vec<crate::compositor::Callback>,
-    pub on_next_key_callback: Option<OnKeyCallback>,
+    pub on_next_key_callback: Option<(OnKeyCallback, OnKeyCallbackKind)>,
     pub jobs: &'a mut Jobs,
 }
 
@@ -120,7 +125,19 @@ impl<'a> Context<'a> {
         &mut self,
         on_next_key_callback: impl FnOnce(&mut Context, KeyEvent) + 'static,
     ) {
-        self.on_next_key_callback = Some(Box::new(on_next_key_callback));
+        self.on_next_key_callback = Some((
+            Box::new(on_next_key_callback),
+            OnKeyCallbackKind::PseudoPending,
+        ));
+    }
+
+    #[inline]
+    pub fn on_next_key_fallback(
+        &mut self,
+        on_next_key_callback: impl FnOnce(&mut Context, KeyEvent) + 'static,
+    ) {
+        self.on_next_key_callback =
+            Some((Box::new(on_next_key_callback), OnKeyCallbackKind::Fallback));
     }
 
     #[inline]
@@ -529,6 +546,8 @@ impl MappableCommand {
         command_palette, "Open command palette",
         goto_word, "Jump to a two-character label",
         extend_to_word, "Extend to a two-character label",
+        goto_next_tabstop, "goto next snippet placeholder",
+        goto_prev_tabstop, "goto next snippet placeholder",
     );
 }
 
@@ -1032,6 +1051,7 @@ fn goto_window(cx: &mut Context, align: Align) {
     let count = cx.count() - 1;
     let config = cx.editor.config();
     let (view, doc) = current!(cx.editor);
+    let view_offset = doc.view_offset(view.id);
 
     let height = view.inner_height();
 
@@ -1044,15 +1064,15 @@ fn goto_window(cx: &mut Context, align: Align) {
     let last_visual_line = view.last_visual_line(doc);
 
     let visual_line = match align {
-        Align::Top => view.offset.vertical_offset + scrolloff + count,
-        Align::Center => view.offset.vertical_offset + (last_visual_line / 2),
+        Align::Top => view_offset.vertical_offset + scrolloff + count,
+        Align::Center => view_offset.vertical_offset + (last_visual_line / 2),
         Align::Bottom => {
-            view.offset.vertical_offset + last_visual_line.saturating_sub(scrolloff + count)
+            view_offset.vertical_offset + last_visual_line.saturating_sub(scrolloff + count)
         }
     };
     let visual_line = visual_line
-        .max(view.offset.vertical_offset + scrolloff)
-        .min(view.offset.vertical_offset + last_visual_line.saturating_sub(scrolloff));
+        .max(view_offset.vertical_offset + scrolloff)
+        .min(view_offset.vertical_offset + last_visual_line.saturating_sub(scrolloff));
 
     let pos = view
         .pos_at_visual_coords(doc, visual_line as u16, 0, false)
@@ -1665,6 +1685,7 @@ pub fn scroll(cx: &mut Context, offset: usize, direction: Direction, sync_cursor
     use Direction::*;
     let config = cx.editor.config();
     let (view, doc) = current!(cx.editor);
+    let mut view_offset = doc.view_offset(view.id);
 
     let range = doc.selection(view.id).primary();
     let text = doc.text().slice(..);
@@ -1681,15 +1702,19 @@ pub fn scroll(cx: &mut Context, offset: usize, direction: Direction, sync_cursor
     let doc_text = doc.text().slice(..);
     let viewport = view.inner_area(doc);
     let text_fmt = doc.text_format(viewport.width, None);
-    let mut annotations = view.text_annotations(&*doc, None);
-    (view.offset.anchor, view.offset.vertical_offset) = char_idx_at_visual_offset(
+    (view_offset.anchor, view_offset.vertical_offset) = char_idx_at_visual_offset(
         doc_text,
-        view.offset.anchor,
-        view.offset.vertical_offset as isize + offset,
+        view_offset.anchor,
+        view_offset.vertical_offset as isize + offset,
         0,
         &text_fmt,
-        &annotations,
+        // &annotations,
+        &view.text_annotations(&*doc, None),
     );
+    doc.set_view_offset(view.id, view_offset);
+
+    let doc_text = doc.text().slice(..);
+    let mut annotations = view.text_annotations(&*doc, None);
 
     if sync_cursor {
         let movement = match cx.editor.mode {
@@ -1716,14 +1741,16 @@ pub fn scroll(cx: &mut Context, offset: usize, direction: Direction, sync_cursor
         return;
     }
 
+    let view_offset = doc.view_offset(view.id);
+
     let mut head;
     match direction {
         Forward => {
             let off;
             (head, off) = char_idx_at_visual_offset(
                 doc_text,
-                view.offset.anchor,
-                (view.offset.vertical_offset + scrolloff) as isize,
+                view_offset.anchor,
+                (view_offset.vertical_offset + scrolloff) as isize,
                 0,
                 &text_fmt,
                 &annotations,
@@ -1736,8 +1763,8 @@ pub fn scroll(cx: &mut Context, offset: usize, direction: Direction, sync_cursor
         Backward => {
             head = char_idx_at_visual_offset(
                 doc_text,
-                view.offset.anchor,
-                (view.offset.vertical_offset + height - scrolloff - 1) as isize,
+                view_offset.anchor,
+                (view_offset.vertical_offset + height - scrolloff - 1) as isize,
                 0,
                 &text_fmt,
                 &annotations,
@@ -3785,7 +3812,11 @@ pub mod insert {
             });
 
             if !cursors_after_whitespace {
-                move_parent_node_end(cx);
+                if doc.active_snippet.is_some() {
+                    goto_next_tabstop(cx);
+                } else {
+                    move_parent_node_end(cx);
+                }
                 return;
             }
         }
@@ -5124,7 +5155,7 @@ fn split(editor: &mut Editor, action: Action) {
     let (view, doc) = current!(editor);
     let id = doc.id();
     let selection = doc.selection(view.id).clone();
-    let offset = view.offset;
+    let offset = doc.view_offset(view.id);
 
     editor.switch(id, action);
 
@@ -5133,7 +5164,7 @@ fn split(editor: &mut Editor, action: Action) {
     doc.set_selection(view.id, selection);
     // match the view scroll offset (switch doesn't handle this fully
     // since the selection is only matched after the split)
-    view.offset = offset;
+    doc.set_view_offset(view.id, offset);
 }
 
 fn hsplit(cx: &mut Context) {
@@ -5228,14 +5259,21 @@ fn align_view_middle(cx: &mut Context) {
         return;
     }
     let doc_text = doc.text().slice(..);
-    let annotations = view.text_annotations(doc, None);
     let pos = doc.selection(view.id).primary().cursor(doc_text);
-    let pos =
-        visual_offset_from_block(doc_text, view.offset.anchor, pos, &text_fmt, &annotations).0;
+    let pos = visual_offset_from_block(
+        doc_text,
+        doc.view_offset(view.id).anchor,
+        pos,
+        &text_fmt,
+        &view.text_annotations(doc, None),
+    )
+    .0;
 
-    view.offset.horizontal_offset = pos
+    let mut offset = doc.view_offset(view.id);
+    offset.horizontal_offset = pos
         .col
         .saturating_sub((view.inner_area(doc).width as usize) / 2);
+    doc.set_view_offset(view.id, offset);
 }
 
 fn scroll_up(cx: &mut Context) {
@@ -5745,14 +5783,20 @@ fn shell(cx: &mut compositor::Context, cmd: &str, behavior: &ShellBehavior) {
         let output = if let Some(output) = shell_output.as_ref() {
             output.clone()
         } else {
-            let fragment = range.slice(text);
-            match shell_impl(shell, cmd, pipe.then(|| fragment.into())) {
-                Ok(result) => {
-                    let result = Tendril::from(result.trim_end());
-                    if !pipe {
-                        shell_output = Some(result.clone());
+            let input = range.slice(text);
+            match shell_impl(shell, cmd, pipe.then(|| input.into())) {
+                Ok(mut output) => {
+                    if !input.ends_with("\n") && !output.is_empty() && output.ends_with('\n') {
+                        output.pop();
+                        if output.ends_with('\r') {
+                            output.pop();
+                        }
                     }
-                    result
+
+                    if !pipe {
+                        shell_output = Some(output.clone());
+                    }
+                    output
                 }
                 Err(err) => {
                     cx.editor.set_error(err.to_string());
@@ -5925,6 +5969,47 @@ fn increment_impl(cx: &mut Context, increment_direction: IncrementDirection) {
         let transaction = transaction.with_selection(new_selection);
         doc.apply(&transaction, view.id);
         exit_select_mode(cx);
+    }
+}
+
+fn goto_next_tabstop(cx: &mut Context) {
+    goto_next_tabstop_impl(cx, Direction::Forward)
+}
+
+fn goto_prev_tabstop(cx: &mut Context) {
+    goto_next_tabstop_impl(cx, Direction::Backward)
+}
+
+fn goto_next_tabstop_impl(cx: &mut Context, direction: Direction) {
+    let (view, doc) = current!(cx.editor);
+    let view_id = view.id;
+    let Some(mut snippet) = doc.active_snippet.take() else {
+        cx.editor.set_error("no snippet is currently active");
+        return;
+    };
+    let tabstop = match direction {
+        Direction::Forward => Some(snippet.next_tabstop(doc.selection(view_id))),
+        Direction::Backward => snippet
+            .prev_tabstop(doc.selection(view_id))
+            .map(|selection| (selection, false)),
+    };
+    let Some((selection, last_tabstop)) = tabstop else {
+        return;
+    };
+    doc.set_selection(view_id, selection);
+    if !last_tabstop {
+        doc.active_snippet = Some(snippet)
+    }
+    if cx.editor.mode() == Mode::Insert {
+        cx.on_next_key_fallback(|cx, key| {
+            if let Some(c) = key.char() {
+                let (view, doc) = current!(cx.editor);
+                if let Some(snippet) = &doc.active_snippet {
+                    doc.apply(&snippet.delete_placeholder(doc.text()), view.id);
+                }
+                insert_char(cx, c);
+            }
+        })
     }
 }
 
@@ -6111,7 +6196,7 @@ fn jump_to_word(cx: &mut Context, behaviour: Movement) {
 
     // This is not necessarily exact if there is virtual text like soft wrap.
     // It's ok though because the extra jump labels will not be rendered.
-    let start = text.line_to_char(text.char_to_line(view.offset.anchor));
+    let start = text.line_to_char(text.char_to_line(doc.view_offset(view.id).anchor));
     let end = text.line_to_char(view.estimate_last_doc_line(doc) + 1);
 
     let primary_selection = doc.selection(view.id).primary();

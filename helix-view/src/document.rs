@@ -7,6 +7,7 @@ use helix_core::auto_pairs::AutoPairs;
 use helix_core::chars::char_is_word;
 use helix_core::doc_formatter::TextFormat;
 use helix_core::encoding::Encoding;
+use helix_core::snippets::{ActiveSnippet, SnippetRenderCtx};
 use helix_core::syntax::{Highlight, LanguageServerFeature};
 use helix_core::text_annotations::{InlineAnnotation, Overlay};
 use helix_lsp::util::lsp_pos_to_pos;
@@ -37,9 +38,12 @@ use helix_core::{
     ChangeSet, Diagnostic, LineEnding, Range, Rope, RopeBuilder, Selection, Syntax, Transaction,
 };
 
-use crate::editor::Config;
-use crate::events::{DocumentDidChange, SelectionDidChange};
-use crate::{DocumentId, Editor, Theme, View, ViewId};
+use crate::{
+    editor::Config,
+    events::{DocumentDidChange, SelectionDidChange},
+    view::ViewPosition,
+    DocumentId, Editor, Theme, View, ViewId,
+};
 
 /// 8kB of buffer space for encoding and decoding `Rope`s.
 const BUF_SIZE: usize = 8192;
@@ -130,6 +134,8 @@ pub struct Document {
     pub(crate) id: DocumentId,
     text: Rope,
     selections: HashMap<ViewId, Selection>,
+    view_data: HashMap<ViewId, ViewData>,
+    pub active_snippet: Option<ActiveSnippet>,
 
     /// Inlay hints annotations for the document, by view.
     ///
@@ -265,6 +271,7 @@ impl fmt::Debug for Document {
             .field("selections", &self.selections)
             .field("inlay_hints_oudated", &self.inlay_hints_oudated)
             .field("text_annotations", &self.inlay_hints)
+            .field("view_data", &self.view_data)
             .field("path", &self.path)
             .field("encoding", &self.encoding)
             .field("restore_cursor", &self.restore_cursor)
@@ -649,6 +656,7 @@ impl Document {
 
         Self {
             id: DocumentId::default(),
+            active_snippet: None,
             path: None,
             encoding,
             has_bom,
@@ -656,6 +664,7 @@ impl Document {
             selections: HashMap::default(),
             inlay_hints: HashMap::default(),
             inlay_hints_oudated: false,
+            view_data: Default::default(),
             indent_style: DEFAULT_INDENT,
             line_ending,
             restore_cursor: false,
@@ -1184,12 +1193,14 @@ impl Document {
         self.set_selection(view_id, Selection::single(origin.anchor, origin.head));
     }
 
-    /// Initializes a new selection for the given view if it does not
-    /// already have one.
+    /// Initializes a new selection and view_data for the given view
+    /// if it does not already have them.
     pub fn ensure_view_init(&mut self, view_id: ViewId) {
         if self.selections.get(&view_id).is_none() {
             self.reset_selection(view_id);
         }
+
+        self.view_data_mut(view_id);
     }
 
     /// Mark document as recent used for MRU sorting
@@ -1214,28 +1225,12 @@ impl Document {
         use helix_core::Assoc;
 
         let old_doc = self.text().clone();
+        let changes = transaction.changes();
+        if !changes.apply(&mut self.text) {
+            return false;
+        }
 
-        let success = transaction.changes().apply(&mut self.text);
-
-        if success {
-            if emit_lsp_notification {
-                helix_event::dispatch(DocumentDidChange {
-                    doc: self,
-                    view: view_id,
-                    old_text: &old_doc,
-                });
-            }
-
-            for selection in self.selections.values_mut() {
-                *selection = selection
-                    .clone()
-                    // Map through changes
-                    .map(transaction.changes())
-                    // Ensure all selections across all views still adhere to invariants.
-                    .ensure_invariants(self.text.slice(..));
-            }
-
-            // if specified, the current selection should instead be replaced by transaction.selection
+        if changes.is_empty() {
             if let Some(selection) = transaction.selection() {
                 self.selections.insert(
                     view_id,
@@ -1246,129 +1241,162 @@ impl Document {
                     view: view_id,
                 });
             }
-
-            self.modified_since_accessed = true;
+            return true;
         }
 
-        if !transaction.changes().is_empty() {
-            self.version += 1;
-            // start computing the diff in parallel
-            if let Some(diff_handle) = &self.diff_handle {
-                diff_handle.update_document(self.text.clone(), false);
-            }
+        self.modified_since_accessed = true;
+        self.version += 1;
 
-            // generate revert to savepoint
-            if !self.savepoints.is_empty() {
-                let revert = transaction.invert(&old_doc);
-                self.savepoints
-                    .retain_mut(|save_point| match save_point.upgrade() {
-                        Some(savepoint) => {
-                            let mut revert_to_savepoint = savepoint.revert.lock();
-                            *revert_to_savepoint =
-                                revert.clone().compose(mem::take(&mut revert_to_savepoint));
-                            true
-                        }
-                        None => false,
-                    })
-            }
+        for selection in self.selections.values_mut() {
+            *selection = selection
+                .clone()
+                // Map through changes
+                .map(transaction.changes())
+                // Ensure all selections across all views still adhere to invariants.
+                .ensure_invariants(self.text.slice(..));
+        }
 
-            // update tree-sitter syntax tree
-            if let Some(syntax) = &mut self.syntax {
-                // TODO: no unwrap
-                let res = syntax.update(
-                    old_doc.slice(..),
-                    self.text.slice(..),
-                    transaction.changes(),
-                );
-                if res.is_err() {
-                    log::error!("TS parser failed, disabling TS for the current buffer: {res:?}");
-                    self.syntax = None;
-                }
-            }
+        for view_data in self.view_data.values_mut() {
+            view_data.view_position.anchor = transaction
+                .changes()
+                .map_pos(view_data.view_position.anchor, Assoc::Before);
+        }
 
-            let changes = transaction.changes();
-
-            // map diagnostics over changes too
-            changes.update_positions(self.diagnostics.iter_mut().map(|diagnostic| {
-                let assoc = if diagnostic.starts_at_word {
-                    Assoc::BeforeWord
-                } else {
-                    Assoc::After
-                };
-                (&mut diagnostic.range.start, assoc)
-            }));
-            changes.update_positions(self.diagnostics.iter_mut().filter_map(|diagnostic| {
-                if diagnostic.zero_width {
-                    // for zero width diagnostics treat the diagnostic as a point
-                    // rather than a range
-                    return None;
-                }
-                let assoc = if diagnostic.ends_at_word {
-                    Assoc::AfterWord
-                } else {
-                    Assoc::Before
-                };
-                Some((&mut diagnostic.range.end, assoc))
-            }));
-            self.diagnostics.retain_mut(|diagnostic| {
-                if diagnostic.zero_width {
-                    diagnostic.range.end = diagnostic.range.start
-                } else if diagnostic.range.start >= diagnostic.range.end {
-                    return false;
-                }
-                diagnostic.line = self.text.char_to_line(diagnostic.range.start);
-                true
-            });
-
-            self.diagnostics.sort_by_key(|diagnostic| {
-                (diagnostic.range, diagnostic.severity, diagnostic.provider)
-            });
-
-            // Update the inlay hint annotations' positions, helping ensure they are displayed in the proper place
-            let apply_inlay_hint_changes = |annotations: &mut Vec<InlineAnnotation>| {
-                changes.update_positions(
-                    annotations
-                        .iter_mut()
-                        .map(|annotation| (&mut annotation.char_idx, Assoc::After)),
-                );
-            };
-
-            self.inlay_hints_oudated = true;
-            for text_annotation in self.inlay_hints.values_mut() {
-                let DocumentInlayHints {
-                    id: _,
-                    type_inlay_hints,
-                    parameter_inlay_hints,
-                    other_inlay_hints,
-                    padding_before_inlay_hints,
-                    padding_after_inlay_hints,
-                } = text_annotation;
-
-                apply_inlay_hint_changes(padding_before_inlay_hints);
-                apply_inlay_hint_changes(type_inlay_hints);
-                apply_inlay_hint_changes(parameter_inlay_hints);
-                apply_inlay_hint_changes(other_inlay_hints);
-                apply_inlay_hint_changes(padding_after_inlay_hints);
-            }
-
-            if emit_lsp_notification {
-                // TODO: move to hook
-                // emit lsp notification
-                for language_server in self.language_servers() {
-                    let notify = language_server.text_document_did_change(
-                        self.versioned_identifier(),
-                        &old_doc,
-                        self.text(),
-                        changes,
-                    );
-
-                    if let Some(notify) = notify {
-                        tokio::spawn(notify);
+        // generate revert to savepoint
+        if !self.savepoints.is_empty() {
+            let revert = transaction.invert(&old_doc);
+            self.savepoints
+                .retain_mut(|save_point| match save_point.upgrade() {
+                    Some(savepoint) => {
+                        let mut revert_to_savepoint = savepoint.revert.lock();
+                        *revert_to_savepoint =
+                            revert.clone().compose(mem::take(&mut revert_to_savepoint));
+                        true
                     }
+                    None => false,
+                })
+        }
+
+        // update tree-sitter syntax tree
+        if let Some(syntax) = &mut self.syntax {
+            // TODO: no unwrap
+            let res = syntax.update(
+                old_doc.slice(..),
+                self.text.slice(..),
+                transaction.changes(),
+            );
+            if res.is_err() {
+                log::error!("TS parser failed, disabling TS for the current buffer: {res:?}");
+                self.syntax = None;
+            }
+        }
+
+        // TODO: all of that should likely just be hooks
+        // start computing the diff in parallel
+        if let Some(diff_handle) = &self.diff_handle {
+            diff_handle.update_document(self.text.clone(), false);
+        }
+
+        // map diagnostics over changes too
+        changes.update_positions(self.diagnostics.iter_mut().map(|diagnostic| {
+            let assoc = if diagnostic.starts_at_word {
+                Assoc::BeforeWord
+            } else {
+                Assoc::After
+            };
+            (&mut diagnostic.range.start, assoc)
+        }));
+        changes.update_positions(self.diagnostics.iter_mut().filter_map(|diagnostic| {
+            if diagnostic.zero_width {
+                // for zero width diagnostics treat the diagnostic as a point
+                // rather than a range
+                return None;
+            }
+            let assoc = if diagnostic.ends_at_word {
+                Assoc::AfterWord
+            } else {
+                Assoc::Before
+            };
+            Some((&mut diagnostic.range.end, assoc))
+        }));
+        self.diagnostics.retain_mut(|diagnostic| {
+            if diagnostic.zero_width {
+                diagnostic.range.end = diagnostic.range.start
+            } else if diagnostic.range.start >= diagnostic.range.end {
+                return false;
+            }
+            diagnostic.line = self.text.char_to_line(diagnostic.range.start);
+            true
+        });
+
+        self.diagnostics
+            .sort_by_key(|diagnostic| (diagnostic.range, diagnostic.severity, diagnostic.provider));
+
+        // Update the inlay hint annotations' positions, helping ensure they are displayed in the proper place
+        let apply_inlay_hint_changes = |annotations: &mut Vec<InlineAnnotation>| {
+            changes.update_positions(
+                annotations
+                    .iter_mut()
+                    .map(|annotation| (&mut annotation.char_idx, Assoc::After)),
+            );
+        };
+
+        self.inlay_hints_oudated = true;
+        for text_annotation in self.inlay_hints.values_mut() {
+            let DocumentInlayHints {
+                id: _,
+                type_inlay_hints,
+                parameter_inlay_hints,
+                other_inlay_hints,
+                padding_before_inlay_hints,
+                padding_after_inlay_hints,
+            } = text_annotation;
+
+            apply_inlay_hint_changes(padding_before_inlay_hints);
+            apply_inlay_hint_changes(type_inlay_hints);
+            apply_inlay_hint_changes(parameter_inlay_hints);
+            apply_inlay_hint_changes(other_inlay_hints);
+            apply_inlay_hint_changes(padding_after_inlay_hints);
+        }
+
+        helix_event::dispatch(DocumentDidChange {
+            doc: self,
+            view: view_id,
+            old_text: &old_doc,
+            changes,
+            ghost_transaction: !emit_lsp_notification,
+        });
+
+        // if specified, the current selection should instead be replaced by transaction.selection
+        if let Some(selection) = transaction.selection() {
+            self.selections.insert(
+                view_id,
+                selection.clone().ensure_invariants(self.text.slice(..)),
+            );
+            helix_event::dispatch(SelectionDidChange {
+                doc: self,
+                view: view_id,
+            });
+        }
+
+        if emit_lsp_notification {
+            // TODO: move to hook
+            // emit lsp notification
+            for language_server in self.language_servers() {
+                let notify = language_server.text_document_did_change(
+                    self.versioned_identifier(),
+                    &old_doc,
+                    self.text(),
+                    changes,
+                );
+
+                if let Some(notify) = notify {
+                    tokio::spawn(notify);
                 }
             }
         }
-        success
+
+        true
     }
 
     fn apply_inner(
@@ -1765,6 +1793,28 @@ impl Document {
         &self.selections
     }
 
+    fn view_data(&self, view_id: ViewId) -> &ViewData {
+        self.view_data
+            .get(&view_id)
+            .expect("This should only be called after ensure_view_init")
+    }
+
+    fn view_data_mut(&mut self, view_id: ViewId) -> &mut ViewData {
+        self.view_data.entry(view_id).or_default()
+    }
+
+    pub(crate) fn get_view_offset(&self, view_id: ViewId) -> Option<ViewPosition> {
+        Some(self.view_data.get(&view_id)?.view_position)
+    }
+
+    pub fn view_offset(&self, view_id: ViewId) -> ViewPosition {
+        self.view_data(view_id).view_position
+    }
+
+    pub fn set_view_offset(&mut self, view_id: ViewId, new_offset: ViewPosition) {
+        self.view_data_mut(view_id).view_position = new_offset;
+    }
+
     pub fn relative_path(&self) -> Option<Cow<Path>> {
         self.path
             .as_deref()
@@ -1951,6 +2001,16 @@ impl Document {
         }
     }
 
+    pub fn snippet_ctx(&self) -> SnippetRenderCtx {
+        SnippetRenderCtx {
+            // TODO snippet variable resolution
+            resolve_var: Box::new(|_| None),
+            tab_width: self.tab_width(),
+            indent_style: self.indent_style,
+            line_ending: self.line_ending.as_str(),
+        }
+    }
+
     pub fn text_format(&self, mut viewport_width: u16, theme: Option<&Theme>) -> TextFormat {
         let config = self.config.load();
         let text_width = self
@@ -2038,6 +2098,11 @@ impl Document {
     pub fn reset_all_inlay_hints(&mut self) {
         self.inlay_hints = Default::default();
     }
+}
+
+#[derive(Debug, Default)]
+pub struct ViewData {
+    view_position: ViewPosition,
 }
 
 #[derive(Clone, Debug)]
